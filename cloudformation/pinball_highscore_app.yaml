@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless Pinball High Score App (Cheap and Simple)
+
+Resources:
+
+  ### DynamoDB Table ###
+  HighScoreTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PinballHighScores
+      AttributeDefinitions:
+        - AttributeName: machine_name
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: machine_name
+          KeyType: HASH
+        - AttributeName: date
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  ### Cognito User Pool ###
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: PinballUserPool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: PinballUserClient
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: false
+
+  ### IAM Role for Lambda ###
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                Resource: !GetAtt HighScoreTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ### Lambda: Submit Score ###
+  SubmitScoreFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SubmitPinballScore
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs18.x
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamo = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event) => {
+            const body = JSON.parse(event.body);
+
+            const params = {
+              TableName: "PinballHighScores",
+              Item: {
+                machine_name: body.machine_name,
+                date: new Date().toISOString(),
+                username: event.requestContext.authorizer.claims["cognito:username"],
+                score: body.score
+              }
+            };
+
+            await dynamo.put(params).promise();
+
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ message: "Score saved!" })
+            };
+          };
+
+  ### Lambda: Fetch Scores ###
+  GetScoresFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetPinballScores
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs18.x
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamo = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event) => {
+            const machine = event.queryStringParameters?.machine_name;
+
+            const params = {
+              TableName: "PinballHighScores",
+              KeyConditionExpression: "machine_name = :m",
+              ExpressionAttributeValues: {
+                ":m": machine
+              },
+              ScanIndexForward: false,
+              Limit: 10
+            };
+
+            const result = await dynamo.query(params).promise();
+
+            return {
+              statusCode: 200,
+              body: JSON.stringify(result.Items)
+            };
+          };
+
+  ### API Gateway ###
+  PinballAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: PinballAPI
+      ProtocolType: HTTP
+
+  PinballAPIIntegrationSubmit:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PinballAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SubmitScoreFunction.Arn}/invocations
+      IntegrationMethod: POST
+
+  PinballAPIIntegrationGet:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PinballAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetScoresFunction.Arn}/invocations
+      IntegrationMethod: GET
+
+  PinballRouteSubmit:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PinballAPI
+      RouteKey: POST /score
+      Target: !Sub integrations/${PinballAPIIntegrationSubmit}
+
+  PinballRouteGet:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PinballAPI
+      RouteKey: GET /scores
+      Target: !Sub integrations/${PinballAPIIntegrationGet}
+
+  SubmitPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SubmitScoreFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PinballAPI}/*/POST/score
+
+  GetPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetScoresFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PinballAPI}/*/GET/scores
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL of the Pinball High Score API
+    Value: !Sub https://${PinballAPI}.execute-api.${AWS::Region}.amazonaws.com/
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: Cognito App Client ID
+    Value: !Ref UserPoolClient
