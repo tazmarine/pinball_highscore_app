@@ -150,7 +150,7 @@ Resources:
       ApiId: !Ref PinballAPI
       IntegrationType: AWS_PROXY
       IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetScoresFunction.Arn}/invocations
-      IntegrationMethod: GET
+      IntegrationMethod: POST
       PayloadFormatVersion: '2.0'
 
   PinballRouteSubmit:
